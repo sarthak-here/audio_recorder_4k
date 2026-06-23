@@ -664,17 +664,40 @@ class AudioRecorder4K(tk.Tk):
     # ── Device management ──────────────────────────────────────────────────────
     def _refresh_devices(self):
         try:
-            devs = sd.query_devices()
+            devs     = sd.query_devices()
+            hostapis = sd.query_hostapis()
+
+            # Prefer WASAPI on Windows — it only lists currently connected hardware
+            preferred_api = None
+            for i, api in enumerate(hostapis):
+                if "WASAPI" in api["name"]:
+                    preferred_api = i
+                    break
+            # Fall back to MME / DirectSound if WASAPI not found
+            if preferred_api is None:
+                for i, api in enumerate(hostapis):
+                    if api["default_input_device"] >= 0:
+                        preferred_api = i
+                        break
+
             names = ["Default"]
             self._device_map = {"Default": None}
+
             for i, d in enumerate(devs):
-                if d["max_input_channels"] > 0:
-                    n = d["name"][:32]
+                if d["max_input_channels"] <= 0:
+                    continue
+                # Skip devices not on the preferred host API
+                if preferred_api is not None and d.get("hostapi") != preferred_api:
+                    continue
+                n = d["name"][:36]
+                if n not in self._device_map:
                     names.append(n)
                     self._device_map[n] = i
+
             self._dev_cb["values"] = names
             if self.v_dev.get() not in names:
                 self.v_dev.set("Default")
+            self.v_status.set(f"Found {len(names)-1} input device(s)  ·  SPACE = Record")
         except Exception as e:
             self.v_status.set(f"Device error: {e}")
 
@@ -807,63 +830,99 @@ class AudioRecorder4K(tk.Tk):
         self._recording = False
         self._paused    = False
 
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        # Read tkinter vars NOW on the main thread before spawning background work
+        save_opts = {
+            "normalize": self.v_normalize.get(),
+            "mono_mix":  self.v_mono_mix.get(),
+            "denoise":   self.v_denoise.get(),
+            "depth":     self.v_depth.get(),
+            "sr":        self.v_sr.get(),
+        }
 
-        if self._audio_chunks:
-            self._save()
-
+        # Respond to the user immediately — no freeze
         self._btn_rec.configure(text="⏺  RECORD", bg=ACCENT_RED)
         self._btn_pause.configure(state="disabled")
         self._btn_stop.configure(state="disabled")
         self._dot_lbl.configure(fg=BG_DARK)
-        self._state_lbl.configure(text="STANDBY", fg=TEXT_DIM)
-        self._vu.update_levels(0, 0)
+        self._state_lbl.configure(text="⏳ SAVING", fg=ACCENT_AMBER)
+        self.v_status.set("Finalizing recording…")
 
-    def _save(self):
-        self.v_status.set("Saving…")
-        self.update()
+        # Hand off stream teardown + disk write to a background thread
+        stream = self._stream
+        chunks = list(self._audio_chunks)
+        path   = self._cur_path
+        self._stream       = None
+        self._audio_chunks = []
+
+        threading.Thread(
+            target=self._bg_stop,
+            args=(stream, chunks, path, save_opts),
+            daemon=True,
+        ).start()
+
+    def _bg_stop(self, stream, chunks, path, opts):
+        """Background thread: close audio stream, process, and write file."""
         try:
-            audio = np.concatenate(self._audio_chunks, axis=0)
+            if stream:
+                stream.stop()
+                stream.close()
+        except Exception:
+            pass
 
-            if self.v_normalize.get():
+        if not chunks or not path:
+            self.after(0, self._finish_stop)
+            return
+
+        try:
+            audio = np.concatenate(chunks, axis=0)
+
+            if opts["normalize"]:
                 peak = np.max(np.abs(audio))
                 if peak > 0:
                     audio = audio * (0.95 / peak)
 
-            if self.v_mono_mix.get() and audio.ndim > 1:
+            if opts["mono_mix"] and audio.ndim > 1:
                 audio = audio.mean(axis=1)
 
-            if self.v_denoise.get():
+            if opts["denoise"]:
                 audio = self._spectral_denoise(audio)
 
-            subtype = BIT_DEPTHS[self.v_depth.get()][1]
+            subtype = BIT_DEPTHS[opts["depth"]][1]
             if subtype == "PCM_16":
                 audio = (audio * 32767).astype(np.int16)
             elif subtype == "PCM_24":
                 audio = (audio * 8388607).astype(np.int32)
 
-            sr = self.v_sr.get()
-            sf.write(str(self._cur_path), audio, sr, subtype=subtype)
+            sr = opts["sr"]
+            sf.write(str(path), audio, sr, subtype=subtype)
 
-            info = sf.info(str(self._cur_path))
-            rec = Recording(self._cur_path, info.duration, sr,
-                            self.v_depth.get(), info.channels)
-            self._recordings.insert(0, rec)
-            self._refresh_list()
+            info = sf.info(str(path))
+            rec  = Recording(path, info.duration, sr, opts["depth"], info.channels)
+            self.after(0, lambda r=rec, i=info, s=sr, d=opts["depth"]:
+                       self._finish_save(r, i, s, d))
 
-            m, s = divmod(info.duration, 60)
-            self.v_status.set(
-                f"Saved: {self._cur_path.name}  "
-                f"({int(m):02d}:{s:05.2f} · {rec.size_mb:.1f} MB)"
-            )
-            self._file_lbl.configure(
-                text=f"{sr:,} Hz · {self.v_depth.get()} · {rec.size_mb:.1f} MB"
-            )
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.after(0, lambda err=str(e):
+                       messagebox.showerror("Save Error", err))
+            self.after(0, self._finish_stop)
+
+    def _finish_save(self, rec, info, sr, depth):
+        """Back on the main thread after a successful save."""
+        self._recordings.insert(0, rec)
+        self._refresh_list()
+        m, s = divmod(info.duration, 60)
+        self.v_status.set(
+            f"Saved: {rec.path.name}  ({int(m):02d}:{s:05.2f} · {rec.size_mb:.1f} MB)"
+        )
+        self._file_lbl.configure(
+            text=f"{sr:,} Hz · {depth} · {rec.size_mb:.1f} MB"
+        )
+        self._finish_stop()
+
+    def _finish_stop(self):
+        """Final UI reset after recording is fully done."""
+        self._vu.update_levels(0, 0)
+        self._state_lbl.configure(text="STANDBY", fg=TEXT_DIM)
 
     # ── Playback ───────────────────────────────────────────────────────────────
     def _toggle_play(self, _=None):
@@ -1119,6 +1178,13 @@ class AudioRecorder4K(tk.Tk):
             if not messagebox.askyesno("Quit", "Recording in progress. Stop and quit?"):
                 return
             self._stop()
+            # _stop is now non-blocking; give the background thread a moment to close the stream
+            self.after(400, self._on_close)
+            return
+        if self._state_lbl.cget("text") == "⏳ SAVING":
+            # Save in progress — check again shortly
+            self.after(200, self._on_close)
+            return
         if self._playing:
             self._stop_play()
         self._save_cfg()
