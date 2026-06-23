@@ -49,6 +49,40 @@ RECORDINGS_DIR  = Path.home() / "Desktop" / "4K_Recordings"
 WAVEFORM_SECS   = 12          # seconds of waveform history shown live
 
 
+class DCBlocker:
+    """First-order high-pass filter that removes DC offset and sub-20Hz rumble.
+    Transfer function: H(z) = (1 - z^-1) / (1 - R*z^-1)
+    """
+    def __init__(self, R: float = 0.9995):
+        self.R = R
+        self._x_prev = None
+        self._y_prev = None
+
+    def reset(self):
+        self._x_prev = None
+        self._y_prev = None
+
+    def process(self, data: np.ndarray) -> np.ndarray:
+        ch = data.shape[1] if data.ndim > 1 else 1
+        if self._x_prev is None:
+            self._x_prev = np.zeros(ch, dtype=np.float32)
+            self._y_prev = np.zeros(ch, dtype=np.float32)
+
+        flat   = data if data.ndim > 1 else data.reshape(-1, 1)
+        out    = np.empty_like(flat)
+        xp, yp = self._x_prev, self._y_prev
+        R      = self.R
+
+        for i in range(len(flat)):
+            y       = flat[i] - xp + R * yp
+            out[i]  = y
+            xp, yp  = flat[i], y
+
+        self._x_prev = xp
+        self._y_prev = yp
+        return out if data.ndim > 1 else out.reshape(-1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VU Meter
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -334,6 +368,9 @@ class AudioRecorder4K(tk.Tk):
         self.v_gate     = tk.DoubleVar(value=cfg.get("gate",     0.0))
         self.v_normalize= tk.BooleanVar(value=cfg.get("normalize",False))
         self.v_mono_mix = tk.BooleanVar(value=cfg.get("mono_mix", False))
+        self.v_dc_block = tk.BooleanVar(value=cfg.get("dc_block", True))
+        self.v_denoise  = tk.BooleanVar(value=cfg.get("denoise",  False))
+        self._dc_blocker = DCBlocker()
         self.v_status   = tk.StringVar(value="Ready · SPACE = Record")
 
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -475,8 +512,10 @@ class AudioRecorder4K(tk.Tk):
 
     def _w_options(self, p):
         for txt, var in (
+            ("DC Block",       self.v_dc_block),
             ("Auto-Normalize", self.v_normalize),
             ("Mono Mix-down",  self.v_mono_mix),
+            ("Denoise (post)", self.v_denoise),
         ):
             tk.Checkbutton(p, text=txt, variable=var,
                            bg=BG_PANEL, fg=TEXT_DIM, selectcolor=BG_MID,
@@ -666,6 +705,7 @@ class AudioRecorder4K(tk.Tk):
         self._cur_path = RECORDINGS_DIR / f"REC_{ts}{ext}"
 
         self._audio_chunks = []
+        self._dc_blocker.reset()
         self._rec_start    = time.time()
         self._total_paused = 0.0
         self._paused       = False
@@ -674,9 +714,9 @@ class AudioRecorder4K(tk.Tk):
 
         try:
             self._stream = sd.InputStream(
-                samplerate=sr, channels=channels, dtype=sd_dtype,
+                samplerate=sr, channels=channels, dtype="float32",
                 device=device, callback=self._audio_cb,
-                blocksize=1024, latency="low",
+                blocksize=4096, latency="high",
             )
             self._stream.start()
         except Exception as e:
@@ -698,8 +738,14 @@ class AudioRecorder4K(tk.Tk):
         if self._paused:
             return
         data = indata.copy()
+
+        # DC offset removal + sub-20Hz rumble filter
+        if self.v_dc_block.get():
+            data = self._dc_blocker.process(data)
+
         gain = 10 ** (self.v_gain_db.get() / 20.0)
         data *= gain
+
         gate = self.v_gate.get()
         if gate > 0:
             rms_per_frame = np.max(np.abs(data), axis=1 if data.ndim > 1 else 0)
@@ -708,6 +754,7 @@ class AudioRecorder4K(tk.Tk):
                 data[mask] = 0
             else:
                 data[mask] = 0
+
         data = np.clip(data, -1.0, 1.0)
         self._q.put(data)
 
@@ -788,6 +835,9 @@ class AudioRecorder4K(tk.Tk):
 
             if self.v_mono_mix.get() and audio.ndim > 1:
                 audio = audio.mean(axis=1)
+
+            if self.v_denoise.get():
+                audio = self._spectral_denoise(audio)
 
             subtype = BIT_DEPTHS[self.v_depth.get()][1]
             if subtype == "PCM_16":
@@ -998,6 +1048,54 @@ class AudioRecorder4K(tk.Tk):
             pass
         return {}
 
+    @staticmethod
+    def _spectral_denoise(audio: np.ndarray,
+                          fft_size: int = 2048,
+                          threshold_db: float = -38.0) -> np.ndarray:
+        """Overlap-add spectral gating. Estimates noise floor from first 0.3s,
+        then suppresses frequency bins below that floor * threshold."""
+        is_stereo = audio.ndim > 1
+        channels  = audio.shape[1] if is_stereo else 1
+        flat      = audio if is_stereo else audio.reshape(-1, 1)
+        out       = np.zeros_like(flat)
+
+        hop  = fft_size // 2
+        win  = np.hanning(fft_size).astype(np.float32)
+        norm = 1e-9
+
+        for ch in range(channels):
+            sig = flat[:, ch]
+
+            # Estimate noise floor from first 0.3 s (≈ first few frames)
+            noise_frames = max(1, int(0.3 * 44100 / hop))
+            noise_est = np.zeros(fft_size // 2 + 1, dtype=np.float32)
+            count = 0
+            for i in range(0, min(noise_frames * hop, len(sig) - fft_size), hop):
+                frame = sig[i:i + fft_size] * win
+                noise_est += np.abs(np.fft.rfft(frame))
+                count += 1
+            if count > 0:
+                noise_est /= count
+
+            threshold = noise_est * (10 ** (threshold_db / 20.0))
+
+            # Overlap-add processing
+            result = np.zeros(len(sig) + fft_size, dtype=np.float32)
+            for i in range(0, len(sig) - fft_size, hop):
+                frame   = sig[i:i + fft_size] * win
+                spec    = np.fft.rfft(frame)
+                mag     = np.abs(spec)
+                phase   = np.angle(spec)
+                # Soft-knee gate: attenuate rather than hard-zero
+                gain_mask = np.maximum(0.0, 1.0 - (threshold / (mag + norm)))
+                mag_clean = mag * gain_mask
+                spec_clean = mag_clean * np.exp(1j * phase)
+                result[i:i + fft_size] += np.fft.irfft(spec_clean) * win
+
+            out[:, ch] = result[:len(sig)]
+
+        return out if is_stereo else out.reshape(-1)
+
     def _save_cfg(self):
         try:
             SETTINGS_FILE.write_text(json.dumps({
@@ -1010,6 +1108,8 @@ class AudioRecorder4K(tk.Tk):
                 "gate":      self.v_gate.get(),
                 "normalize": self.v_normalize.get(),
                 "mono_mix":  self.v_mono_mix.get(),
+                "dc_block":  self.v_dc_block.get(),
+                "denoise":   self.v_denoise.get(),
             }))
         except:
             pass
